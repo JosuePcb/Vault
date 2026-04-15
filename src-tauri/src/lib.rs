@@ -17,6 +17,7 @@ pub struct AppState {
     pub email_client: Mutex<EmailClient>,
     pub encryption_key: Mutex<Option<Vec<u8>>>,
     pub algorithm: Mutex<CryptoAlgorithm>,
+    pub alert_email: Mutex<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,10 +82,21 @@ fn encrypt_file_cmd(
     input_path: String,
     output_path: String,
 ) -> Result<EncryptResult, String> {
-    let key = state.encryption_key.lock().map_err(|e| e.to_string())?
-        .clone()
-        .ok_or("No encryption key set")?;
     let algorithm = state.algorithm.lock().map_err(|e| e.to_string())?.clone();
+    
+    // Generate key automatically if not set
+    let key = if let Ok(mut mutex) = state.encryption_key.lock() {
+        if let Some(ref k) = *mutex {
+            k.clone()
+        } else {
+            let new_key = generate_key(&algorithm);
+            let key_clone = new_key.clone();
+            *mutex = Some(new_key);
+            key_clone
+        }
+    } else {
+        return Err("Failed to access encryption key state".to_string());
+    };
     
     encrypt_file(&input_path, &output_path, &key, &algorithm).map_err(|e| e.to_string())?;
     
@@ -232,6 +244,172 @@ fn is_email_configured(state: State<AppState>) -> Result<bool, String> {
     Ok(client.is_configured())
 }
 
+#[tauri::command]
+fn set_alert_email(state: State<AppState>, email: String) -> Result<(), String> {
+    let mut alert_email = state.alert_email.lock().map_err(|e| e.to_string())?;
+    *alert_email = email;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_alert_email(state: State<AppState>) -> Result<String, String> {
+    let alert_email = state.alert_email.lock().map_err(|e| e.to_string())?;
+    Ok(alert_email.clone())
+}
+
+#[tauri::command]
+fn send_alert(state: State<AppState>, path: String, event_type: String, description: String) -> Result<String, String> {
+    let client = state.email_client.lock().map_err(|e| e.to_string())?;
+    let alert_email = state.alert_email.lock().map_err(|e| e.to_string())?;
+    
+    if alert_email.is_empty() {
+        return Err("Email de alertas no configurado".to_string());
+    }
+    
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    runtime.block_on(client.send_alert(&[alert_email.clone()], &path, &event_type, &description))
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DirEncryptResult {
+    pub success: bool,
+    pub files_encrypted: Vec<String>,
+    pub key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DirDecryptResult {
+    pub success: bool,
+    pub files_decrypted: Vec<String>,
+}
+
+#[tauri::command]
+fn encrypt_dir_cmd(
+    state: State<AppState>,
+    input_dir: String,
+    output_dir: String,
+) -> Result<DirEncryptResult, String> {
+    let algorithm = state.algorithm.lock().map_err(|e| e.to_string())?.clone();
+    
+    let key = if let Ok(mut mutex) = state.encryption_key.lock() {
+        if let Some(ref k) = *mutex {
+            k.clone()
+        } else {
+            let new_key = generate_key(&algorithm);
+            let key_clone = new_key.clone();
+            *mutex = Some(new_key);
+            key_clone
+        }
+    } else {
+        return Err("Failed to access encryption key state".to_string());
+    };
+    
+    let input_path = std::path::Path::new(&input_dir);
+    let output_path = std::path::Path::new(&output_dir);
+    
+    if !input_path.exists() {
+        return Err("Input directory does not exist".to_string());
+    }
+    
+    std::fs::create_dir_all(output_path).map_err(|e| e.to_string())?;
+    
+    let mut files_encrypted = Vec::new();
+    
+    for entry in walkdir::WalkDir::new(input_path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let relative_path = entry.path().strip_prefix(input_path)
+            .map_err(|e| e.to_string())?;
+        
+        let output_file = output_path.join(relative_path);
+        
+        if let Some(parent) = output_file.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        
+        let input_file_str = entry.path().to_string_lossy().to_string();
+        let output_file_str = output_file.to_string_lossy().to_string();
+        
+        if let Err(e) = encrypt_file(&input_file_str, &output_file_str, &key, &algorithm) {
+            continue;
+        }
+        
+        files_encrypted.push(relative_path.to_string_lossy().to_string());
+    }
+    
+    if let Ok(audit) = state.audit_log.lock() {
+        if let Some(ref log) = *audit {
+            let _ = log.log_event("encrypt_dir", &input_dir, &format!("{} files encrypted", files_encrypted.len()));
+        }
+    }
+    
+    Ok(DirEncryptResult {
+        success: true,
+        files_encrypted,
+        key: key_to_base64(&key),
+    })
+}
+
+#[tauri::command]
+fn decrypt_dir_cmd(
+    state: State<AppState>,
+    input_dir: String,
+    output_dir: String,
+    key_base64: String,
+) -> Result<DirDecryptResult, String> {
+    let key = key_from_base64(&key_base64).map_err(|e| e.to_string())?;
+    let algorithm = state.algorithm.lock().map_err(|e| e.to_string())?.clone();
+    
+    let input_path = std::path::Path::new(&input_dir);
+    let output_path = std::path::Path::new(&output_dir);
+    
+    if !input_path.exists() {
+        return Err("Input directory does not exist".to_string());
+    }
+    
+    std::fs::create_dir_all(output_path).map_err(|e| e.to_string())?;
+    
+    let mut files_decrypted = Vec::new();
+    
+    for entry in walkdir::WalkDir::new(input_path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let relative_path = entry.path().strip_prefix(input_path)
+            .map_err(|e| e.to_string())?;
+        
+        let output_file = output_path.join(relative_path);
+        
+        if let Some(parent) = output_file.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        
+        let input_file_str = entry.path().to_string_lossy().to_string();
+        let output_file_str = output_file.to_string_lossy().to_string();
+        
+        if let Err(e) = decrypt_file(&input_file_str, &output_file_str, &key, &algorithm) {
+            continue;
+        }
+        
+        files_decrypted.push(relative_path.to_string_lossy().to_string());
+    }
+    
+    if let Ok(audit) = state.audit_log.lock() {
+        if let Some(ref log) = *audit {
+            let _ = log.log_event("decrypt_dir", &input_dir, &format!("{} files decrypted", files_decrypted.len()));
+        }
+    }
+    
+    Ok(DirDecryptResult {
+        success: true,
+        files_decrypted,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_data_dir = dirs::data_local_dir()
@@ -246,12 +424,20 @@ pub fn run() {
     let audit_log = AuditLog::new(db_path.to_str().unwrap_or("audit.db"), &hmac_key).ok();
     let file_watcher = FileWatcher::new();
     
+    let mut email_client = EmailClient::new();
+    email_client.configure(EmailConfig {
+        api_key: "re_Ej8rRnrw_5FXybUvBaUKDrudDkuEPtPkB".to_string(),
+        from_email: "noreply@resend.dev".to_string(),
+        from_name: "Vault".to_string(),
+    });
+    
     let state = AppState {
         audit_log: Mutex::new(audit_log),
         file_watcher: Mutex::new(None),
-        email_client: Mutex::new(EmailClient::new()),
+        email_client: Mutex::new(email_client),
         encryption_key: Mutex::new(None),
         algorithm: Mutex::new(CryptoAlgorithm::Aes256),
+        alert_email: Mutex::new(String::new()),
     };
     
     tauri::Builder::default()
@@ -276,6 +462,11 @@ pub fn run() {
             send_email_alert,
             test_email,
             is_email_configured,
+            set_alert_email,
+            get_alert_email,
+            send_alert,
+            encrypt_dir_cmd,
+            decrypt_dir_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
