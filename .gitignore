@@ -39,3 +39,9 @@ target/
 Thumbs.db
 db/
 
+# Vite temporary files
+vite.config.ts.timestamp-*.mjs
+
+# Vault application files
+*.vault
+*.vault-meta
