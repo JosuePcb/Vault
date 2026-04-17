@@ -1,4 +1,5 @@
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,6 +29,7 @@ pub struct FileEvent {
 pub struct FileWatcher {
     watchers: Mutex<HashMap<String, WatcherHandle>>,
     events: Arc<Mutex<Vec<FileEvent>>>,
+    db_path: Mutex<Option<String>>,
 }
 
 struct WatcherHandle {
@@ -40,10 +42,42 @@ impl FileWatcher {
         FileWatcher {
             watchers: Mutex::new(HashMap::new()),
             events: Arc::new(Mutex::new(Vec::new())),
+            db_path: Mutex::new(None),
+        }
+    }
+
+    pub fn set_db_path(&self, path: &str) {
+        if let Ok(mut db) = self.db_path.lock() {
+            *db = Some(path.to_string());
         }
     }
 
     pub fn get_recent_events(&self, limit: usize) -> Vec<FileEvent> {
+        if let Ok(db) = self.db_path.lock() {
+            if let Some(ref db_path) = *db {
+                if let Ok(conn) = Connection::open(db_path) {
+                    let mut stmt = match conn.prepare(
+                        "SELECT id, timestamp, event_type, path FROM watcher_events ORDER BY id DESC LIMIT ?"
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => return Vec::new(),
+                    };
+                    let events: Vec<FileEvent> = stmt
+                        .query_map([limit as i64], |row| {
+                            Ok(FileEvent {
+                                path: row.get(3)?,
+                                event_type: row.get(2)?,
+                                timestamp: row.get(1)?,
+                            })
+                        })
+                        .ok()
+                        .map(|iter| iter.filter_map(|e| e.ok()).collect())
+                        .unwrap_or_default();
+                    return events;
+                }
+            }
+        }
+
         match self.events.lock() {
             Ok(events) => {
                 let total = events.len();
@@ -90,6 +124,12 @@ impl FileWatcher {
 
         let events = self.events.clone();
 
+        let db_path = if let Ok(db) = self.db_path.lock() {
+            db.clone()
+        } else {
+            None
+        };
+
         thread::spawn(move || loop {
             if stop_rx.try_recv().is_ok() {
                 break;
@@ -114,11 +154,17 @@ impl FileWatcher {
                     eprintln!("[WATCHER] {} - {}", file_event.event_type, file_event.path);
 
                     if let Ok(mut ev) = events.lock() {
-                        ev.push(file_event);
+                        ev.push(file_event.clone());
                         if ev.len() > 1000 {
                             ev.remove(0);
                         }
                     }
+
+                    save_watcher_event_to_db(
+                        db_path.clone(),
+                        event_type,
+                        &path.display().to_string(),
+                    );
                 }
             }
         });
@@ -165,5 +211,21 @@ impl FileWatcher {
 impl Default for FileWatcher {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn save_watcher_event_to_db(db_path: Option<String>, event_type: &str, path: &str) {
+    if let Some(db) = db_path {
+        if let Ok(conn) = Connection::open(&db) {
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            let _ = conn.execute(
+                "INSERT INTO watcher_events (timestamp, event_type, path) VALUES (?1, ?2, ?3)",
+                rusqlite::params![timestamp, event_type, path],
+            );
+            let _ = conn.execute(
+                "DELETE FROM watcher_events WHERE id NOT IN (SELECT id FROM watcher_events ORDER BY id DESC LIMIT 500)",
+                [],
+            );
+        }
     }
 }

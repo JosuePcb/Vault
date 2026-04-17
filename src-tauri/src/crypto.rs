@@ -612,3 +612,113 @@ pub fn decrypt_dir_container(
 
     Ok(output_path.to_string_lossy().to_string())
 }
+
+const VAULT_FILE_MAGIC: &[u8; 14] = b"VAULT_FILE_END";
+
+pub fn encrypt_file_vault(
+    file_path: &str,
+    key: &[u8],
+    algorithm: &CryptoAlgorithm,
+) -> Result<FileMetadata, CryptoError> {
+    let path = std::path::Path::new(file_path);
+    let original_extension = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let original_path = file_path.to_string();
+
+    let data = std::fs::read(file_path)?;
+    let encrypted = encrypt_data(&data, key, algorithm)?;
+
+    let mut vault_data = encrypted;
+    vault_data.extend_from_slice(VAULT_FILE_MAGIC);
+
+    let vault_path = format!("{}.vault", file_path);
+    std::fs::write(&vault_path, &vault_data)?;
+
+    let key_b64 = key_to_base64(key);
+    let algo_str = match algorithm {
+        CryptoAlgorithm::Aes256 => "AES-256",
+        CryptoAlgorithm::ChaCha20 => "ChaCha20",
+    };
+
+    let metadata = FileMetadata {
+        original_path: original_path.clone(),
+        algorithm: algo_str.to_string(),
+        original_extension: original_extension.clone(),
+        key: key_b64.clone(),
+    };
+
+    let meta_path = format!("{}.vault-meta", file_path);
+    let meta_json = serde_json::to_string(&metadata).map_err(|e| {
+        CryptoError::IoError(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        ))
+    })?;
+    std::fs::write(&meta_path, meta_json)?;
+
+    let _ = std::fs::remove_file(file_path);
+
+    Ok(FileMetadata {
+        original_path,
+        algorithm: algo_str.to_string(),
+        original_extension,
+        key: key_b64.clone(),
+    })
+}
+
+pub fn decrypt_file_vault(
+    file_path: &str,
+    key: &[u8],
+    algorithm: &CryptoAlgorithm,
+) -> Result<String, CryptoError> {
+    let meta_path = format!("{}-meta", file_path);
+    if !std::path::Path::new(&meta_path).exists() {
+        return Err(CryptoError::DecryptionFailed(
+            "Archivo .vault-meta no encontrado".to_string(),
+        ));
+    }
+
+    let meta_json = std::fs::read_to_string(&meta_path)?;
+    let metadata: FileMetadata = serde_json::from_str(&meta_json)
+        .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
+
+    let vault_data = std::fs::read(file_path)?;
+
+    let magic_len = VAULT_FILE_MAGIC.len();
+    if vault_data.len() < magic_len {
+        return Err(CryptoError::DecryptionFailed(
+            "Archivo vault corrupto".to_string(),
+        ));
+    }
+
+    let magic_from_file = &vault_data[vault_data.len() - magic_len..];
+    if magic_from_file != VAULT_FILE_MAGIC {
+        return Err(CryptoError::DecryptionFailed(
+            "Magic inválido - archivo corrupto".to_string(),
+        ));
+    }
+
+    let encrypted = &vault_data[..vault_data.len() - magic_len];
+    let decrypted = decrypt_data(encrypted, key, algorithm)?;
+
+    let output_path = if file_path.ends_with(".vault") {
+        format!(
+            "{}{}",
+            file_path.trim_end_matches(".vault"),
+            metadata.original_extension
+        )
+    } else {
+        return Err(CryptoError::DecryptionFailed(
+            "Archivo no tiene extensión .vault".to_string(),
+        ));
+    };
+
+    std::fs::write(&output_path, decrypted)?;
+
+    let _ = std::fs::remove_file(file_path);
+    let _ = std::fs::remove_file(&meta_path);
+
+    Ok(output_path)
+}

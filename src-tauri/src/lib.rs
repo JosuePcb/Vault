@@ -7,7 +7,7 @@ mod auth;
 use std::sync::Mutex;
 use tauri::State;
 use serde::{Deserialize, Serialize};
-use crypto::{CryptoAlgorithm, generate_key, encrypt_file, decrypt_file, key_to_base64, key_from_base64, encrypt_file_inplace, decrypt_file_inplace, FileMetadata, encrypt_dir_container, decrypt_dir_container, DirMetadata};
+use crypto::{CryptoAlgorithm, generate_key, encrypt_file, decrypt_file, key_to_base64, key_from_base64, encrypt_file_vault, decrypt_file_vault, FileMetadata, encrypt_dir_container, decrypt_dir_container, DirMetadata};
 use audit::AuditLog;
 use watcher::FileWatcher;
 use email::{EmailClient, EmailConfig};
@@ -165,11 +165,11 @@ fn encrypt_file_cmd(
         return Err("Failed to access encryption key state".to_string());
     };
     
-    let metadata = encrypt_file_inplace(&file_path, &key, &algorithm).map_err(|e| e.to_string())?;
+    let metadata = encrypt_file_vault(&file_path, &key, &algorithm).map_err(|e| e.to_string())?;
     
     if let Ok(audit) = state.audit_log.lock() {
         if let Some(ref log) = *audit {
-            let _ = log.log_event("encrypt", &file_path, "File encrypted in-place");
+            let _ = log.log_event("encrypt", &file_path, "File encrypted to .vault");
         }
     }
     
@@ -191,11 +191,11 @@ fn decrypt_file_cmd(
     let key = key_from_base64(&key_base64).map_err(|e| e.to_string())?;
     let algorithm = state.algorithm.lock().map_err(|e| e.to_string())?.clone();
     
-    let original_extension = decrypt_file_inplace(&file_path, &key, &algorithm).map_err(|e| e.to_string())?;
+    let output_path = decrypt_file_vault(&file_path, &key, &algorithm).map_err(|e| e.to_string())?;
     
     if let Ok(audit) = state.audit_log.lock() {
         if let Some(ref log) = *audit {
-            let _ = log.log_event("decrypt", &file_path, "File decrypted in-place");
+            let _ = log.log_event("decrypt", &file_path, "File decrypted from .vault");
         }
     }
     
@@ -205,7 +205,7 @@ fn decrypt_file_cmd(
     
     Ok(DecryptResult {
         success: true,
-        output_path: original_extension,
+        output_path,
     })
 }
 
@@ -566,6 +566,7 @@ pub fn run() {
     
     let audit_log = AuditLog::new(db_path.to_str().unwrap_or("audit.db"), &hmac_key).ok();
     let file_watcher = FileWatcher::new();
+    file_watcher.set_db_path(db_path.to_str().unwrap_or("audit.db"));
     
     for path in &config.watched_paths {
         if std::path::Path::new(path).exists() {

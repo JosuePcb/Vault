@@ -208,8 +208,9 @@ function FileManager() {
       if (targetType === 'file') {
         const filePath = await open({
           multiple: false,
-          title: 'Seleccionar archivo encriptado',
+          title: 'Seleccionar archivo .vault para descifrar',
           directory: false,
+          filters: [{ name: 'Vault Files', extensions: ['vault'] }],
         });
 
         if (!filePath) return;
@@ -259,7 +260,7 @@ function FileManager() {
       <h2 className="text-lg font-semibold text-gray-800 dark:text-white">Gestor de Archivos</h2>
       <div className="bg-white dark:bg-gray-800 p-6 rounded-lg border border-gray-200 dark:border-gray-700">
         <p className="text-gray-500 dark:text-gray-400 text-sm mb-4">
-          Al cifrar un archivo, el contenido se reemplaza con datos cifrados. Necesitas la clave para descifrarlo después.
+          Al cifrar un archivo, se crea un archivo .vault junto con un archivo .vault-meta. Necesitas la clave para descifrarlo después.
         </p>
         
         <div className="relative mb-6">
@@ -340,10 +341,10 @@ function FileManager() {
             {loading ? 'Procesando...' : 'Cifrar archivo'}
           </button>
           <button
-            onClick={() => { setShowDecryptInput(!showDecryptInput); setMessage(null); }}
+            onClick={() => { setShowDecryptInput(!showDecryptInput); setMessage(null); setDecryptKey(''); }}
             className="px-4 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 text-sm font-medium rounded hover:bg-gray-50 dark:hover:bg-gray-600 transition-colors"
           >
-            {showDecryptInput ? 'Cancelar' : 'Descifrar archivo'}
+            {showDecryptInput ? 'Cancelar' : 'Seleccionar archivo .vault'}
           </button>
           {showDecryptInput && (
             <button

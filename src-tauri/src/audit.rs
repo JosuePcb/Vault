@@ -30,6 +30,14 @@ pub struct AuditEvent {
     pub hmac: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatcherEvent {
+    pub id: i64,
+    pub timestamp: String,
+    pub event_type: String,
+    pub path: String,
+}
+
 pub struct AuditLog {
     conn: Mutex<Connection>,
     hmac_key: Vec<u8>,
@@ -52,10 +60,61 @@ impl AuditLog {
             [],
         )?;
 
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS watcher_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                path TEXT NOT NULL
+            )",
+            [],
+        )?;
+
         Ok(AuditLog {
             conn: Mutex::new(conn),
             hmac_key: hmac_key.to_vec(),
         })
+    }
+
+    pub fn log_watcher_event(&self, event_type: &str, path: &str) -> Result<(), AuditError> {
+        let conn = self.conn.lock().map_err(|_| AuditError::LockError)?;
+        let timestamp = Utc::now().to_rfc3339();
+
+        conn.execute(
+            "INSERT INTO watcher_events (timestamp, event_type, path) VALUES (?1, ?2, ?3)",
+            params![timestamp, event_type, path],
+        )?;
+
+        conn.execute(
+            "DELETE FROM watcher_events WHERE id NOT IN (SELECT id FROM watcher_events ORDER BY id DESC LIMIT 500)",
+            [],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn get_watcher_events(&self, limit: usize) -> Result<Vec<WatcherEvent>, AuditError> {
+        let conn = self.conn.lock().map_err(|_| AuditError::LockError)?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, timestamp, event_type, path FROM watcher_events ORDER BY id DESC LIMIT ?",
+        )?;
+
+        let events = stmt.query_map([limit], |row| {
+            Ok(WatcherEvent {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                event_type: row.get(2)?,
+                path: row.get(3)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for event in events {
+            result.push(event?);
+        }
+
+        Ok(result)
     }
 
     fn compute_hmac(&self, data: &str) -> String {
