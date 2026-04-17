@@ -1,75 +1,126 @@
 # Vault
-## De que trata el proyecto?
 
-Vault es un cifrador y tracker de archivos y directorios que permite mantener segura la informacion del usuario.
-## Requisitos Funcionales
+Aplicación de escritorio para cifrado de archivos y directorios con tracking de actividad y auditoría segura.
 
-- Cifrar archivos y directorios con claves cifradas o con llaves fisicas (USB).
+## Descripción
 
-- Registrar actividad realizada en los directorios y sus archivos.
+Vault permite cifrar archivos individuales o directorios completos, preservando la extensión original y generando contenedores `.vault` que solo pueden descifrarse con la clave correcta. Incluye un log de auditoría con cadena HMAC para detectar manipulaciones.
 
-- Notificar al usuario cuando se detecte actividad sospechosa en los directorios y sus archivos mediante correo electronico.
+## Funcionalidades
 
-- Permitir a los usuarios avanzados escoger el estándar de cifrado (por ejemplo: AES-256, ChaCha20, etc.).
-## Requisitos no funcionales
+- **Cifrado de archivos**: AES-256 o ChaCha20 con encriptación autenticada (AES-GCM, ChaCha20-Poly1305)
+- **Cifrado de directorios**: Comprime y cifra directorios completos en un único archivo `.vault`
+- **Preservación de extensiones**: La extensión original se guarda en los metadatos y se restaura al descifrar
+- **Autenticación**: Sistema de password opcional con Argon2 para proteger el acceso a la app
+- **Log de auditoría**: Registro inmutable con cadena HMAC que detecta cualquier modificación
+- **Notificaciones por email**: Alertas automáticas via Resend API cuando se cifran/descifran archivos
+- **File watching**: Monitoreo de directorios para detectar cambios (en desarrollo)
 
-- Multiplataforma
-
-- El registro de actividad y auditoría debe estar protegido. Si un atacante entra, lo primero que hará será intentar borrar el log; este archivo debe estar cifrado o tener firmas de integridad.
 ## Stack Tecnológico
-### Lenguaje
 
--Rust — Lógica del sistema, cifrado y backend.
+| Componente | Tecnología |
+|------------|------------|
+| Framework | Tauri 2.x |
+| Backend | Rust + Tokio |
+| Frontend | React + TypeScript + Tailwind CSS |
+| Cifrado | aes-gcm, chacha20poly1305 (RustCrypto) |
+| Auditoría | rusqlite + HMAC-SHA256 |
+| Email | reqwest + Resend API |
 
--JavaScript — Lógica de la interfaz de usuario.
-### Framework de escritorio
+## Arquitectura
 
--Tauri — Alternativa ligera a Electron que utiliza el WebView nativo del sistema y un core en Rust.
-### Frontend (Renderer Process)
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Renderer Process (React)              │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐   │
+│  │Dashboard │ │  Cifrar  │ │ Descifrar│ │ Settings │   │
+│  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘   │
+└───────┼────────────┼────────────┼────────────┼──────────┘
+        │            │            │            │
+        └────────────┴─────┬──────┴────────────┘
+                            │ Tauri Commands (IPC)
+┌───────────────────────────┴────────────────────────────────┐
+│                     Main Process (Rust)                     │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐      │
+│  │ crypto  │  │ audit   │  │ watcher │  │  email  │      │
+│  │  .rs    │  │  .rs    │  │  .rs    │  │  .rs    │      │
+│  └─────────┘  └─────────┘  └─────────┘  └─────────┘      │
+└─────────────────────────────────────────────────────────────┘
+```
 
-- React — librería de UI
+## Formato de Archivos
 
-- Tailwind CSS — estilos
-### Backend (Main Process)
+### Archivo cifrado (`.vault` + `.vault-meta`)
 
--Tauri Commands — Comunicación segura entre el frontend y las funciones de Rust.
+Cuando se cifra un archivo:
+1. El archivo original se reemplaza por `{nombre}.vault` (datos cifrados + magic `VAULT_FILE_END`)
+2. Se crea `{nombre}.vault-meta` con la clave y metadatos
+3. El archivo original se elimina
 
--Tokio — Runtime asíncrono para el manejo eficiente de hilos.
-### Dependencias clave
+```
+archivo.pdf → archivo.pdf.vault      (datos cifrados + magic)
+            → archivo.pdf.vault-meta (clave en Base64 + extensión original)
+```
 
-| Librería         | Propósito                             | Notas                                                               |
-| ---------------- | ------------------------------------- | ------------------------------------------------------------------- |
-| `RustCrypto`    | Cifrado de alto nivel    | Usa los crates aes-gcm y chacha20poly1305. Son el estándar de la industria en Rust.                                |
-| `notify`       | Watching de archivos y directorios    |Es la librería más madura para monitorear eventos del sistema de archivos de forma eficiente.        |
-| `rusb`       | Integración con llaves físicas USB    | Un wrapper de libusb que te permitirá interactuar con las llaves físicas de forma nativa. |
-| `lettre`     | Notificaciones por correo | Es una librería de correo electrónico robusta y bien mantenida. |
-| `rusqlite` | Log de auditoría estructurado         | Es un wrapper de SQLite para Rust, muy rápido y seguro. |
-|`tauri-plugin-stronghold`	|Almacenamiento de secretos	|Protege claves y llaves en memoria cifrada
+### Directorio cifrado (`.vault` + `.vault-meta`)
 
----
+Cuando se cifra un directorio:
+1. Se crea un ZIP con todos los archivos (cada uno cifrado individualmente)
+2. El ZIP se cifra y guarda como `{directorio}.vault`
+3. Se crea `{directorio}.vault-meta` con la clave y lista de archivos
+4. Los archivos originales se eliminan
 
-## Diseño del Log de Auditoría
-### SQLite + HMAC encadenado (Implementado en Rust)
+```
+mi_carpeta/ → mi_carpeta.vault       (ZIP cifrado)
+            → mi_carpeta.vault-meta  (clave + metadatos)
+```
 
-Cada fila del log contiene una columna prev_hmac que referencia el hash de la fila anterior. Esta cadena de integridad asegura que si un registro es alterado o eliminado, la validación fallará inmediatamente.
+## Sistema de Auditoría
 
-- Persistencia: Se utiliza rusqlite para una gestión eficiente de los datos en el disco local.
+El log de auditoría usa una cadena HMAC para garantizar integridad:
 
-- Integridad: El cálculo del HMAC se realiza en el proceso de Rust, fuera del alcance del proceso de renderizado, lo que añade una capa extra de seguridad.
+```
+┌────┬─────────────────┬──────────┬─────────────────────────────────┐
+│ ID │   Timestamp      │ Tipo     │ HMAC Chain                      │
+├────┼─────────────────┼──────────┼─────────────────────────────────┤
+│  1 │ 2024-01-01T...   │ encrypt  │ prev=GENESIS, hmac=H(1)         │
+│  2 │ 2024-01-01T...   │ decrypt  │ prev=H(1), hmac=H(2)            │
+│  3 │ 2024-01-01T...   │ encrypt  │ prev=H(2), hmac=H(3)            │
+└────┴─────────────────┴──────────┴─────────────────────────────────┘
+```
 
-- Consultas: Soporta filtros por fecha y tipo de evento directamente desde la interfaz mediante commands de Tauri.
-
-
-### Estructura de la tabla SQLite:
-┌─────┬──────────────────┬───────────┬────────┬────────────┬────────────┬─────────────┐
-│  id │ timestamp        │ event_type│ path   │ description│ prev_hmac │ hmac       │
-├─────┼──────────────────┼───────────┼────────┼────────────┼────────────┼─────────────┤
-│  1  │ 2024-01-01T...   │ encrypt   │ /path/ │ File enc.. │ (empty)    │ HMAC(1)    │
-│  2  │ 2024-01-01T...   │ decrypt   │ /path/ │ File dec.. │ HMAC(1)    │ HMAC(2)    │
-└─────┴──────────────────┴───────────┴────────┴────────────┴────────────┴─────────────┘
-
-Cadena HMAC:
-- Cada registro incluye el HMAC del registro anterior (prev_hmac)
-- El HMAC actual se calcula: HMAC(timestamp + event_type + path + description + prev_hmac)
+- Cada registro incluye `prev_hmac` (HMAC del registro anterior)
 - Si alguien modifica un registro, la cadena se rompe
-- Permite detectar manipulación
+- Validación: `validate_audit_integrity` detecta manipulación
+- Reparación: `repair_audit_integrity` elimina registros corruptos
+
+## Configuración
+
+Ubicación: `%LOCALAPPDATA%\vault\config.json`
+
+```json
+{
+  "alert_email": "user@example.com",
+  "algorithm": "AES-256"
+}
+```
+
+Autenticación: `%LOCALAPPDATA%\vault\auth.json`
+
+Base de datos: `%LOCALAPPDATA%\vault\audit.db`
+
+## Ejecución
+
+```bash
+# Desarrollo
+npm run tauri dev
+
+# Producción
+npm run tauri build
+```
+
+## Requisitos
+
+- Rust (https://rustup.rs)
+- Node.js
+- Windows 10/11 (desarrollo actual)
