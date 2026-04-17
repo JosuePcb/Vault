@@ -2,14 +2,65 @@ mod crypto;
 mod audit;
 mod watcher;
 mod email;
+mod auth;
 
 use std::sync::Mutex;
 use tauri::State;
 use serde::{Deserialize, Serialize};
-use crypto::{CryptoAlgorithm, generate_key, encrypt_file, decrypt_file, key_to_base64, key_from_base64};
+use crypto::{CryptoAlgorithm, generate_key, encrypt_file, decrypt_file, key_to_base64, key_from_base64, encrypt_file_inplace, decrypt_file_inplace, FileMetadata, encrypt_dir_container, decrypt_dir_container, DirMetadata};
 use audit::AuditLog;
 use watcher::FileWatcher;
 use email::{EmailClient, EmailConfig};
+use auth::AuthResult;
+use std::fs;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AppConfig {
+    pub alert_email: String,
+    pub algorithm: String,
+    pub password_hash: Option<String>,
+    pub watched_paths: Vec<String>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        AppConfig {
+            alert_email: String::new(),
+            algorithm: "AES-256".to_string(),
+            password_hash: None,
+            watched_paths: Vec::new(),
+        }
+    }
+}
+
+fn get_config_path() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("vault")
+        .join("config.json")
+}
+
+fn load_config() -> AppConfig {
+    let config_path = get_config_path();
+    if config_path.exists() {
+        if let Ok(content) = fs::read_to_string(&config_path) {
+            if let Ok(config) = serde_json::from_str(&content) {
+                return config;
+            }
+        }
+    }
+    AppConfig::default()
+}
+
+fn save_config(config: &AppConfig) -> Result<(), String> {
+    let config_path = get_config_path();
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let content = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
+    fs::write(config_path, content).map_err(|e| e.to_string())?;
+    Ok(())
+}
 
 pub struct AppState {
     pub audit_log: Mutex<Option<AuditLog>>,
@@ -40,6 +91,15 @@ pub struct DecryptResult {
     pub output_path: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IntegrityResult {
+    pub is_valid: bool,
+    pub status: String,
+    pub last_valid_id: i64,
+    pub failed_at: Option<String>,
+    pub details: String,
+}
+
 #[tauri::command]
 fn generate_encryption_key(state: State<AppState>) -> Result<String, String> {
     let algorithm = state.algorithm.lock().map_err(|e| e.to_string())?;
@@ -62,7 +122,16 @@ fn set_algorithm(state: State<AppState>, algorithm: String) -> Result<(), String
         "ChaCha20" => CryptoAlgorithm::ChaCha20,
         _ => return Err("Invalid algorithm".to_string()),
     };
-    *state.algorithm.lock().map_err(|e| e.to_string())? = algo;
+    *state.algorithm.lock().map_err(|e| e.to_string())? = algo.clone();
+    
+    let alert_email = state.alert_email.lock().map_err(|e| e.to_string())?.clone();
+    let config = AppConfig {
+        alert_email,
+        algorithm: algorithm,
+        password_hash: None,
+        watched_paths: Vec::new(),
+    };
+    save_config(&config)?;
     Ok(())
 }
 
@@ -79,12 +148,10 @@ fn get_algorithm(state: State<AppState>) -> Result<String, String> {
 #[tauri::command]
 fn encrypt_file_cmd(
     state: State<AppState>,
-    input_path: String,
-    output_path: String,
-) -> Result<EncryptResult, String> {
+    file_path: String,
+) -> Result<FileMetadata, String> {
     let algorithm = state.algorithm.lock().map_err(|e| e.to_string())?.clone();
     
-    // Generate key automatically if not set
     let key = if let Ok(mut mutex) = state.encryption_key.lock() {
         if let Some(ref k) = *mutex {
             k.clone()
@@ -98,44 +165,47 @@ fn encrypt_file_cmd(
         return Err("Failed to access encryption key state".to_string());
     };
     
-    encrypt_file(&input_path, &output_path, &key, &algorithm).map_err(|e| e.to_string())?;
+    let metadata = encrypt_file_inplace(&file_path, &key, &algorithm).map_err(|e| e.to_string())?;
     
-    // Log the event
     if let Ok(audit) = state.audit_log.lock() {
         if let Some(ref log) = *audit {
-            let _ = log.log_event("encrypt", &input_path, "File encrypted");
+            let _ = log.log_event("encrypt", &file_path, "File encrypted in-place");
         }
     }
     
-    Ok(EncryptResult {
-        success: true,
-        output_path,
-        key: key_to_base64(&key),
-    })
+    send_audit_email(&state, &file_path, "encrypt", "Archivo cifrado");
+    
+    if let Ok(mut key_guard) = state.encryption_key.lock() {
+        *key_guard = None;
+    }
+    
+    Ok(metadata)
 }
 
 #[tauri::command]
 fn decrypt_file_cmd(
     state: State<AppState>,
-    input_path: String,
-    output_path: String,
+    file_path: String,
     key_base64: String,
 ) -> Result<DecryptResult, String> {
     let key = key_from_base64(&key_base64).map_err(|e| e.to_string())?;
     let algorithm = state.algorithm.lock().map_err(|e| e.to_string())?.clone();
     
-    decrypt_file(&input_path, &output_path, &key, &algorithm).map_err(|e| e.to_string())?;
+    let original_extension = decrypt_file_inplace(&file_path, &key, &algorithm).map_err(|e| e.to_string())?;
     
-    // Log the event
     if let Ok(audit) = state.audit_log.lock() {
         if let Some(ref log) = *audit {
-            let _ = log.log_event("decrypt", &input_path, "File decrypted");
+            let _ = log.log_event("decrypt", &file_path, "File decrypted in-place");
         }
     }
     
+    send_audit_email(&state, &file_path, "decrypt", "Archivo descifrado");
+    
+    let _ = state.encryption_key.lock().map(|mut k| *k = None);
+    
     Ok(DecryptResult {
         success: true,
-        output_path,
+        output_path: original_extension,
     })
 }
 
@@ -180,27 +250,96 @@ fn get_audit_logs(
 }
 
 #[tauri::command]
-fn validate_audit_integrity(state: State<AppState>) -> Result<bool, String> {
+fn validate_audit_integrity(state: State<AppState>) -> Result<IntegrityResult, String> {
     let audit = state.audit_log.lock().map_err(|e| e.to_string())?;
     let log = audit.as_ref().ok_or("Audit log not initialized")?;
-    log.validate_integrity().map_err(|e| e.to_string())
+    
+    let (is_valid, last_valid_id, failed_at, details) = log.validate_integrity_detailed()
+        .map_err(|e| e.to_string())?;
+    
+    Ok(IntegrityResult {
+        is_valid,
+        status: if is_valid { "VALID".to_string() } else { "COMPROMISED".to_string() },
+        last_valid_id,
+        failed_at,
+        details,
+    })
+}
+
+#[tauri::command]
+fn repair_audit_integrity(state: State<AppState>) -> Result<IntegrityResult, String> {
+    let audit = state.audit_log.lock().map_err(|e| e.to_string())?;
+    let log = audit.as_ref().ok_or("Audit log not initialized")?;
+    
+    let (is_valid, last_valid_id, failed_at, details) = log.repair_integrity().map_err(|e| e.to_string())?;
+    
+    Ok(IntegrityResult {
+        is_valid,
+        status: if is_valid { "REPAIRED".to_string() } else { "ERROR".to_string() },
+        last_valid_id,
+        failed_at,
+        details,
+    })
 }
 
 #[tauri::command]
 fn start_watching(
+    state: State<AppState>,
     path: String,
 ) -> Result<(), String> {
+    let watcher = state.file_watcher.lock().map_err(|e| e.to_string())?;
+    
+    if let Some(ref w) = *watcher {
+        w.start_watching(&path).map_err(|e| e.to_string())?;
+    }
+    
+    let mut config = load_config();
+    if !config.watched_paths.contains(&path) {
+        config.watched_paths.push(path);
+        save_config(&config)?;
+    }
+    
     Ok(())
 }
 
 #[tauri::command]
-fn stop_watching(path: String) -> Result<(), String> {
+fn stop_watching(
+    state: State<AppState>,
+    path: String,
+) -> Result<(), String> {
+    let watcher = state.file_watcher.lock().map_err(|e| e.to_string())?;
+    
+    if let Some(ref w) = *watcher {
+        w.stop_watching(&path).map_err(|e| e.to_string())?;
+    }
+    
+    let mut config = load_config();
+    config.watched_paths.retain(|p| p != &path);
+    save_config(&config)?;
+    
     Ok(())
 }
 
 #[tauri::command]
-fn get_watched_paths() -> Result<Vec<String>, String> {
-    Ok(vec![])
+fn get_watched_paths(state: State<AppState>) -> Result<Vec<String>, String> {
+    let watcher = state.file_watcher.lock().map_err(|e| e.to_string())?;
+    
+    if let Some(ref w) = *watcher {
+        w.get_watched_paths().map_err(|e| e.to_string())
+    } else {
+        Ok(vec![])
+    }
+}
+
+#[tauri::command]
+fn get_watcher_events(state: State<AppState>, limit: usize) -> Result<Vec<watcher::FileEvent>, String> {
+    let watcher = state.file_watcher.lock().map_err(|e| e.to_string())?;
+    
+    if let Some(ref w) = *watcher {
+        Ok(w.get_recent_events(limit))
+    } else {
+        Ok(vec![])
+    }
 }
 
 #[tauri::command]
@@ -238,6 +377,22 @@ fn test_email(state: State<AppState>, to: Vec<String>) -> Result<String, String>
         .map_err(|e| e.to_string())
 }
 
+fn send_audit_email(state: &State<AppState>, path: &str, event_type: &str, description: &str) {
+    if let (Ok(client), Ok(alert_email)) = (state.email_client.lock(), state.alert_email.lock()) {
+        if !alert_email.is_empty() && client.is_configured() {
+            let runtime = tokio::runtime::Runtime::new();
+            if let Ok(runtime) = runtime {
+                let _ = runtime.block_on(client.send_alert(
+                    &[alert_email.clone()],
+                    path,
+                    event_type,
+                    description
+                ));
+            }
+        }
+    }
+}
+
 #[tauri::command]
 fn is_email_configured(state: State<AppState>) -> Result<bool, String> {
     let client = state.email_client.lock().map_err(|e| e.to_string())?;
@@ -247,7 +402,21 @@ fn is_email_configured(state: State<AppState>) -> Result<bool, String> {
 #[tauri::command]
 fn set_alert_email(state: State<AppState>, email: String) -> Result<(), String> {
     let mut alert_email = state.alert_email.lock().map_err(|e| e.to_string())?;
-    *alert_email = email;
+    *alert_email = email.clone();
+    
+    let algorithm = state.algorithm.lock().map_err(|e| e.to_string())?.clone();
+    let algo_str = match algorithm {
+        CryptoAlgorithm::Aes256 => "AES-256",
+        CryptoAlgorithm::ChaCha20 => "ChaCha20",
+    };
+    
+    let config = AppConfig {
+        alert_email: email,
+        algorithm: algo_str.to_string(),
+        password_hash: None,
+        watched_paths: Vec::new(),
+    };
+    save_config(&config)?;
     Ok(())
 }
 
@@ -288,7 +457,6 @@ pub struct DirDecryptResult {
 fn encrypt_dir_cmd(
     state: State<AppState>,
     input_dir: String,
-    output_dir: String,
 ) -> Result<DirEncryptResult, String> {
     let algorithm = state.algorithm.lock().map_err(|e| e.to_string())?.clone();
     
@@ -306,107 +474,73 @@ fn encrypt_dir_cmd(
     };
     
     let input_path = std::path::Path::new(&input_dir);
-    let output_path = std::path::Path::new(&output_dir);
     
     if !input_path.exists() {
         return Err("Input directory does not exist".to_string());
     }
     
-    std::fs::create_dir_all(output_path).map_err(|e| e.to_string())?;
-    
-    let mut files_encrypted = Vec::new();
-    
-    for entry in walkdir::WalkDir::new(input_path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
-        let relative_path = entry.path().strip_prefix(input_path)
-            .map_err(|e| e.to_string())?;
-        
-        let output_file = output_path.join(relative_path);
-        
-        if let Some(parent) = output_file.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        
-        let input_file_str = entry.path().to_string_lossy().to_string();
-        let output_file_str = output_file.to_string_lossy().to_string();
-        
-        if let Err(e) = encrypt_file(&input_file_str, &output_file_str, &key, &algorithm) {
-            continue;
-        }
-        
-        files_encrypted.push(relative_path.to_string_lossy().to_string());
-    }
+    let (metadata, _encrypted) = encrypt_dir_container(&input_dir, &key, &algorithm).map_err(|e| e.to_string())?;
     
     if let Ok(audit) = state.audit_log.lock() {
         if let Some(ref log) = *audit {
-            let _ = log.log_event("encrypt_dir", &input_dir, &format!("{} files encrypted", files_encrypted.len()));
+            let _ = log.log_event("encrypt_dir", &input_dir, &format!("{} files encrypted", metadata.files.len()));
         }
     }
     
+    send_audit_email(&state, &input_dir, "encrypt_dir", &format!("{} archivos cifrados", metadata.files.len()));
+    
+    let _ = state.encryption_key.lock().map(|mut k| *k = None);
+    
     Ok(DirEncryptResult {
         success: true,
-        files_encrypted,
-        key: key_to_base64(&key),
+        files_encrypted: metadata.files.iter().map(|f| f.path.clone()).collect(),
+        key: metadata.key,
     })
+}
+
+#[tauri::command]
+fn check_auth_status() -> Result<bool, String> {
+    Ok(auth::is_password_set())
+}
+
+#[tauri::command]
+fn setup_password(password: String) -> Result<AuthResult, String> {
+    if password.len() < 4 {
+        return Ok(AuthResult {
+            success: false,
+            message: "Password must be at least 4 characters".to_string(),
+        });
+    }
+    auth::set_password(&password).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn login(password: String) -> Result<AuthResult, String> {
+    auth::check_password(&password).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn decrypt_dir_cmd(
     state: State<AppState>,
-    input_dir: String,
-    output_dir: String,
+    input_file: String,
     key_base64: String,
 ) -> Result<DirDecryptResult, String> {
     let key = key_from_base64(&key_base64).map_err(|e| e.to_string())?;
     let algorithm = state.algorithm.lock().map_err(|e| e.to_string())?.clone();
     
-    let input_path = std::path::Path::new(&input_dir);
-    let output_path = std::path::Path::new(&output_dir);
-    
-    if !input_path.exists() {
-        return Err("Input directory does not exist".to_string());
-    }
-    
-    std::fs::create_dir_all(output_path).map_err(|e| e.to_string())?;
-    
-    let mut files_decrypted = Vec::new();
-    
-    for entry in walkdir::WalkDir::new(input_path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
-        let relative_path = entry.path().strip_prefix(input_path)
-            .map_err(|e| e.to_string())?;
-        
-        let output_file = output_path.join(relative_path);
-        
-        if let Some(parent) = output_file.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        
-        let input_file_str = entry.path().to_string_lossy().to_string();
-        let output_file_str = output_file.to_string_lossy().to_string();
-        
-        if let Err(e) = decrypt_file(&input_file_str, &output_file_str, &key, &algorithm) {
-            continue;
-        }
-        
-        files_decrypted.push(relative_path.to_string_lossy().to_string());
-    }
+    let result = decrypt_dir_container(&input_file, &key, &algorithm).map_err(|e| e.to_string())?;
     
     if let Ok(audit) = state.audit_log.lock() {
         if let Some(ref log) = *audit {
-            let _ = log.log_event("decrypt_dir", &input_dir, &format!("{} files decrypted", files_decrypted.len()));
+            let _ = log.log_event("decrypt_dir", &input_file, "Directory decrypted");
         }
     }
     
+    send_audit_email(&state, &input_file, "decrypt_dir", "Directorio descifrado");
+    
     Ok(DirDecryptResult {
         success: true,
-        files_decrypted,
+        files_decrypted: vec![result],
     })
 }
 
@@ -419,25 +553,45 @@ pub fn run() {
     std::fs::create_dir_all(&app_data_dir).ok();
     
     let db_path = app_data_dir.join("audit.db");
+    let config = load_config();
+    
+    let algorithm = match config.algorithm.as_str() {
+        "ChaCha20" => CryptoAlgorithm::ChaCha20,
+        _ => CryptoAlgorithm::Aes256,
+    };
+    
+    dotenv::dotenv().ok();
+    
     let hmac_key = generate_key(&CryptoAlgorithm::Aes256);
     
     let audit_log = AuditLog::new(db_path.to_str().unwrap_or("audit.db"), &hmac_key).ok();
     let file_watcher = FileWatcher::new();
     
+    for path in &config.watched_paths {
+        if std::path::Path::new(path).exists() {
+            if let Err(e) = file_watcher.start_watching(path) {
+                eprintln!("Failed to restore watch on {}: {}", path, e);
+            }
+        }
+    }
+    
     let mut email_client = EmailClient::new();
-    email_client.configure(EmailConfig {
-        api_key: "re_Ej8rRnrw_5FXybUvBaUKDrudDkuEPtPkB".to_string(),
-        from_email: "noreply@resend.dev".to_string(),
-        from_name: "Vault".to_string(),
-    });
+    let resend_api_key = std::env::var("RESEND_API_KEY").unwrap_or_default();
+    if !resend_api_key.is_empty() {
+        email_client.configure(EmailConfig {
+            api_key: resend_api_key,
+            from_email: "noreply@resend.dev".to_string(),
+            from_name: "Vault".to_string(),
+        });
+    }
     
     let state = AppState {
         audit_log: Mutex::new(audit_log),
-        file_watcher: Mutex::new(None),
+        file_watcher: Mutex::new(Some(file_watcher)),
         email_client: Mutex::new(email_client),
         encryption_key: Mutex::new(None),
-        algorithm: Mutex::new(CryptoAlgorithm::Aes256),
-        alert_email: Mutex::new(String::new()),
+        algorithm: Mutex::new(algorithm),
+        alert_email: Mutex::new(config.alert_email),
     };
     
     tauri::Builder::default()
@@ -455,9 +609,11 @@ pub fn run() {
             get_stats,
             get_audit_logs,
             validate_audit_integrity,
+            repair_audit_integrity,
             start_watching,
             stop_watching,
             get_watched_paths,
+            get_watcher_events,
             configure_email,
             send_email_alert,
             test_email,
@@ -467,6 +623,9 @@ pub fn run() {
             send_alert,
             encrypt_dir_cmd,
             decrypt_dir_cmd,
+            check_auth_status,
+            setup_password,
+            login,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

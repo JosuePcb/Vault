@@ -24,21 +24,37 @@ Tauri desktop application for file encryption and activity tracking with audit l
 | Encryption | `aes-gcm`, `chacha20poly1305` (RustCrypto) | AES-256, ChaCha20 support |
 | File watching | `notify` | Monitor file/directory activity |
 | USB keys | `rusb` | Physical key integration (not implemented yet) |
-| Email | `reqwest` + Resend API | Suspicious activity notifications |
+| Email | `reqwest` + Resend API | Alerts on encryption/decryption events |
 | Audit log | `rusqlite` | SQLite-based structured logging with HMAC chain |
 | Secrets storage | `dirs` | Local app data directory |
 
 ## Email Configuration
 
 - **Provider**: Resend API
-- **API Key**: User provides their own (stored in app state)
-- **Usage**: Send alerts when suspicious file activity is detected
+- **From Email**: `noreply@resend.dev`
+- **Usage**: Send alerts when file is encrypted/decrypted (auto-sent)
+
+## Config File
+
+Location: `%LOCALAPPDATA%\vault\config.json`
+
+```json
+{
+  "alert_email": "user@email.com",
+  "algorithm": "AES-256"
+}
+```
+
+Automatically loaded on app start, persisted when changed.
 
 ## Design Decisions
 
-- **Audit log integrity**: HMAC-chained SQLite (each row contains `prev_hmac` referencing previous row hash) - validation fails if any record is modified/deleted
+- **In-place encryption**: File is replaced with encrypted data, metadata saved in `.vault-meta` file
+- **Extension preservation**: Original file extension saved in metadata, restored on decrypt
+- **Key storage**: User must save the key - displayed in UI after encryption (copy button)
+- **Audit log integrity**: HMAC-chained SQLite - validation fails if any record is modified/deleted
+- **Auto-repair**: Compromised audit log can be automatically repaired
 - **Encryption modes**: User-selectable (AES-256, ChaCha20)
-- **Key storage**: Keys saved to `.key` files alongside encrypted files
 - **Platform**: Cross-platform (Tauri)
 
 ## Implemented Tauri Commands
@@ -49,17 +65,47 @@ Tauri desktop application for file encryption and activity tracking with audit l
 | `set_encryption_key` | Set encryption key manually |
 | `set_algorithm` | Set encryption algorithm (AES-256 or ChaCha20) |
 | `get_algorithm` | Get current encryption algorithm |
-| `encrypt_file_cmd` | Encrypt file with current key |
-| `decrypt_file_cmd` | Decrypt file with provided key |
+| `encrypt_file_cmd` | Encrypt file in-place (same file) |
+| `decrypt_file_cmd` | Decrypt file in-place with extension restore |
 | `get_stats` | Get dashboard statistics |
 | `get_audit_logs` | Get audit log events |
-| `validate_audit_integrity` | Validate HMAC chain integrity |
+| `validate_audit_integrity` | Validate HMAC chain integrity (detailed result) |
+| `repair_audit_integrity` | Auto-repair compromised audit log |
 | `start_watching` | Start file watcher (not implemented in UI) |
 | `stop_watching` | Stop file watcher |
 | `get_watched_paths` | Get watched paths |
 | `configure_email` | Configure Resend API settings |
 | `test_email` | Send test email |
 | `is_email_configured` | Check if email is configured |
+| `set_alert_email` | Set alert destination email |
+| `get_alert_email` | Get alert destination email |
+| `send_alert` | Send manual alert |
+
+| Directory Encryption | Encrypt directory to single .vault container file |
+| `decrypt_dir_cmd` | Decrypt .vault container back to original directory |
+| `encrypt_dir_container` | Encrypt directory contents to in-memory zip, then encrypt (internal) |
+| `decrypt_dir_container` | Decrypt .vault file, extract zip, restore directory (internal) |
+
+## File Encryption Flow
+
+### Encrypt (In-Place)
+1. User selects file via dialog
+2. Backend reads file content
+3. Backend encrypts content in memory
+4. Backend writes encrypted data to SAME file (overwrites original)
+5. Backend creates `{filename}.vault-meta` file with:
+   - `original_path`: Original file path
+   - `algorithm`: Encryption algorithm used
+   - `original_extension`: Original file extension (e.g., `.png`, `.pdf`)
+   - `key`: Encryption key in Base64
+6. Key displayed in UI for user to copy/save
+
+### Decrypt (In-Place)
+1. User selects `.vault-meta` file via dialog
+2. Backend reads metadata from file
+3. Backend decrypts encrypted file content
+4. Backend restores original extension
+5. Metadata file deleted after successful decrypt
 
 ## Project Structure
 
@@ -68,7 +114,7 @@ Tauri desktop application for file encryption and activity tracking with audit l
   /src/
     main.rs    # Entry point
     lib.rs     # Tauri commands and app state
-    crypto.rs  # Encryption module
+    crypto.rs  # Encryption module (in-place, metadata)
     audit.rs   # Audit log with HMAC chain
     watcher.rs # File watcher (not fully integrated)
     email.rs   # Email client (Resend API)
@@ -110,12 +156,6 @@ npm run tauri build
 ```
 
 Output: `src-tauri/target/release/vault.exe`
-
-## Configuration
-
-- **Algorithm**: Select in Settings (AES-256 default)
-- **Email**: Configure in Settings with Resend API key
-- **Key files**: Saved as `.key` files alongside encrypted files
 
 ## Known Issues
 

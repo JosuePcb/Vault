@@ -58,3 +58,18 @@ Cada fila del log contiene una columna prev_hmac que referencia el hash de la fi
 - Integridad: El cálculo del HMAC se realiza en el proceso de Rust, fuera del alcance del proceso de renderizado, lo que añade una capa extra de seguridad.
 
 - Consultas: Soporta filtros por fecha y tipo de evento directamente desde la interfaz mediante commands de Tauri.
+
+
+### Estructura de la tabla SQLite:
+┌─────┬──────────────────┬───────────┬────────┬────────────┬────────────┬─────────────┐
+│  id │ timestamp        │ event_type│ path   │ description│ prev_hmac │ hmac       │
+├─────┼──────────────────┼───────────┼────────┼────────────┼────────────┼─────────────┤
+│  1  │ 2024-01-01T...   │ encrypt   │ /path/ │ File enc.. │ (empty)    │ HMAC(1)    │
+│  2  │ 2024-01-01T...   │ decrypt   │ /path/ │ File dec.. │ HMAC(1)    │ HMAC(2)    │
+└─────┴──────────────────┴───────────┴────────┴────────────┴────────────┴─────────────┘
+
+Cadena HMAC:
+- Cada registro incluye el HMAC del registro anterior (prev_hmac)
+- El HMAC actual se calcula: HMAC(timestamp + event_type + path + description + prev_hmac)
+- Si alguien modifica un registro, la cadena se rompe
+- Permite detectar manipulación

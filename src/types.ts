@@ -41,3 +41,18 @@ export interface DirDecryptResult {
   success: boolean;
   files_decrypted: string[];
 }
+
+export interface IntegrityResult {
+  is_valid: boolean;
+  status: string;
+  last_valid_id: number;
+  failed_at: string | null;
+  details: string;
+}
+
+export interface FileMetadata {
+  original_path: string;
+  algorithm: string;
+  original_extension: string;
+  key: string;
+}
